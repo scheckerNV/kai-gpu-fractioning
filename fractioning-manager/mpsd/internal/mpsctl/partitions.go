@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // EnsureSMPartition creates a missing partition and verifies its full-device
@@ -23,15 +24,17 @@ func (c *Control) EnsureSMPartition(ctx context.Context, server, device, name st
 	if !strings.HasPrefix(device, "GPU-") || chunks < 1 {
 		return fmt.Errorf("invalid SM partition device/chunks")
 	}
-	check := func() (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	check := func() (string, error) {
 		out, err := c.exec(ctx, c.timeout, "sm-partition", "list", "--server="+server, "--all", "--format=csv")
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		r := csv.NewReader(strings.NewReader(string(out)))
 		header, err := r.Read()
 		if err != nil {
-			return false, fmt.Errorf("SM partition CSV header: %w", err)
+			return "", fmt.Errorf("SM partition CSV header: %w", err)
 		}
 		columns := map[string]int{}
 		for i, h := range header {
@@ -39,44 +42,65 @@ func (c *Control) EnsureSMPartition(ctx context.Context, server, device, name st
 		}
 		for _, h := range []string{"SERVER", "DEVICE", "NAME", "CHUNKS", "SHAREABLE", "STATUS"} {
 			if _, ok := columns[h]; !ok {
-				return false, fmt.Errorf("SM partition CSV lacks %s", h)
+				return "", fmt.Errorf("SM partition CSV lacks %s", h)
 			}
 		}
-		found := false
+		found := ""
 		for {
 			row, err := r.Read()
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
-				return false, fmt.Errorf("SM partition CSV: %w", err)
+				return "", fmt.Errorf("SM partition CSV: %w", err)
 			}
 			field := func(h string) string { return strings.TrimSpace(row[columns[h]]) }
 			if field("SERVER") != server || field("DEVICE") != device || field("NAME") != name {
 				continue
 			}
-			if found {
-				return false, fmt.Errorf("duplicate SM partition %s/%s/%s", server, device, name)
+			if found != "" {
+				return "", fmt.Errorf("duplicate SM partition %s/%s/%s", server, device, name)
 			}
-			if field("CHUNKS") != strconv.Itoa(chunks) || field("SHAREABLE") != "false" || field("STATUS") != "created" {
-				return false, fmt.Errorf("SM partition %s/%s disagrees with requested non-shareable %d chunks: %v", device, name, chunks, row)
+			if field("CHUNKS") != strconv.Itoa(chunks) || field("SHAREABLE") != "false" {
+				return "", fmt.Errorf("SM partition %s/%s disagrees with requested non-shareable %d chunks: %v", device, name, chunks, row)
 			}
-			found = true
+			if field("STATUS") != "created" && field("STATUS") != "configured" {
+				return "", fmt.Errorf("unsupported SM partition status %q", field("STATUS"))
+			}
+			found = field("STATUS")
 		}
 		return found, nil
 	}
-	if found, err := check(); err != nil || found {
+	state, err := check()
+	if err != nil || state == "created" {
 		return err
 	}
-	_, createErr := c.exec(ctx, c.timeout, "sm-partition", "create", name, "--server="+server, "--device="+device, "--chunks="+strconv.Itoa(chunks))
-	found, err := check()
-	if err != nil {
-		return err
+	var createErr error
+	if state == "" {
+		_, createErr = c.exec(ctx, c.timeout, "sm-partition", "create", name, "--server="+server, "--device="+device, "--chunks="+strconv.Itoa(chunks))
 	}
-	if !found {
-		return fmt.Errorf("SM partition %s/%s not present after creation (create error: %v)", device, name, createErr)
+	// Creation is asynchronous: a matching configured row is not ready yet.
+	// Do not issue create again or hand a worker a partly initialized partition.
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, err = check()
+		if err != nil {
+			return err
+		}
+		if state == "created" {
+			return nil
+		}
+		if state == "" && createErr != nil {
+			return fmt.Errorf("creating SM partition %s/%s: %w", device, name, createErr)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for SM partition %s/%s to become created: %w", device, name, ctx.Err())
+		case <-ticker.C:
+		}
 	}
-	return nil
+
 }
 
 // SetNamespaceSMPartition requires the r620 per-device namespace API. Older

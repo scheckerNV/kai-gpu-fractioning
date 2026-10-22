@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 const partitionGPU = "GPU-ca40ff2c-28b4-e6eb-d2e0-c534167bdb32"
@@ -78,5 +79,48 @@ func TestNamespaceDeviceBindingUsesCanonicalDeviceAndRejectsDuplicateReadback(t 
 	r.out = []byte(strings.Repeat(partitionGPU+":a0\n", 2))
 	if _, err := c.NamespaceSMPartitions(context.Background(), "shared", "kai_a"); err == nil {
 		t.Fatal("duplicate GPU binding accepted")
+	}
+}
+
+// The live r620 daemon returns configured before asynchronously creating SMs.
+func TestEnsurePartitionWaitsForConfiguredState(t *testing.T) {
+	lists, creates := 0, 0
+	c := New(Options{Binary: "mps", Timeout: time.Second, Run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if slices.Contains(args, "create") {
+			creates++
+			return nil, nil
+		}
+		lists++
+		if lists == 1 {
+			return []byte(partitionHeader), nil
+		}
+		state, count := "configured", "-"
+		if lists >= 3 {
+			state, count = "created", "36"
+		}
+		return []byte(partitionHeader + fmt.Sprintf("shared,%s,a0,18,%s,false,false,-,-,%s,token\n", partitionGPU, count, state)), nil
+	}})
+	if err := c.EnsureSMPartition(context.Background(), "shared", partitionGPU, "a0", 18); err != nil {
+		t.Fatal(err)
+	}
+	if creates != 1 || lists != 3 {
+		t.Fatal(creates, lists)
+	}
+}
+func TestEnsureConfiguredPartitionTimesOutWithoutRecreating(t *testing.T) {
+	creates := 0
+	c := New(Options{Binary: "mps", Timeout: time.Second, Run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if slices.Contains(args, "create") {
+			creates++
+		}
+		return []byte(partitionHeader + fmt.Sprintf("shared,%s,a0,18,-,false,false,-,-,configured,-\n", partitionGPU)), nil
+	}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if err := c.EnsureSMPartition(ctx, "shared", partitionGPU, "a0", 18); err == nil {
+		t.Fatal("configured partition considered ready")
+	}
+	if creates != 0 {
+		t.Fatal("recreated a pending partition")
 	}
 }
