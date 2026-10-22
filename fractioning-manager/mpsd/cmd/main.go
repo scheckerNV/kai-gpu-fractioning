@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/kai-scheduler/kai-gpu-fractioning/fractioning-manager/common/configuration"
+	"github.com/kai-scheduler/kai-gpu-fractioning/fractioning-manager/common/smpolicy"
 	"github.com/kai-scheduler/kai-gpu-fractioning/fractioning-manager/mpsd/internal"
 	"github.com/kai-scheduler/kai-gpu-fractioning/fractioning-manager/mpsd/internal/drain"
 	"github.com/kai-scheduler/kai-gpu-fractioning/fractioning-manager/mpsd/internal/driverlabel"
@@ -168,7 +169,13 @@ func buildNamespaceManager(flags cliFlags, control *mpsctl.Control, logger *slog
 		return nil
 	}
 
+	policy, err := smpolicy.Parse(flags.smPartitionPolicy)
+	if err != nil {
+		logger.Error("invalid SM partition policy; sm-sharing containers will be refused", "error", err)
+		return nil
+	}
 	manager, err := mpsns.New(mpsns.Options{
+		SMPartitionPolicy:   policy,
 		Control:             control,
 		Server:              internal.DefaultSharedServerName,
 		StatePath:           flags.namespaceStatePath,

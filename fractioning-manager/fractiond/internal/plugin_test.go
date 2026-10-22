@@ -2459,12 +2459,13 @@ func TestNVMLShimMountSourceAgreesWithTheStagingPath(t *testing.T) {
 type fakeProvisioner struct {
 	mu sync.Mutex
 
-	pipeDirectory string
-	namespace     string
-	provisionErr  error
-	releaseResp   mpsdrain.ReleaseResponse
-	releaseErr    error
-	block         bool
+	pipeDirectory    string
+	staticPartitions bool
+	namespace        string
+	provisionErr     error
+	releaseResp      mpsdrain.ReleaseResponse
+	releaseErr       error
+	block            bool
 
 	provisions []mpsdrain.ProvisionRequest
 	releases   []mpsdrain.ReleaseRequest
@@ -2503,11 +2504,16 @@ func (f *fakeProvisioner) Provision(ctx context.Context, req mpsdrain.ProvisionR
 	if err != nil {
 		return mpsdrain.ProvisionResponse{}, err
 	}
+	percent := req.ActiveThreadPercent
+	if f.staticPartitions {
+		percent = 100
+	}
 	return mpsdrain.ProvisionResponse{
+		StaticPartitions:    f.staticPartitions,
 		PipeDirectory:       dir,
 		Namespace:           namespace,
 		Server:              "shared",
-		ActiveThreadPercent: req.ActiveThreadPercent,
+		ActiveThreadPercent: percent,
 	}, nil
 }
 
@@ -3051,5 +3057,29 @@ func TestProvisioningThatOverrunsTheBudgetBlocksTheContainer(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("CreateContainer() never returned; the provision call is not bounded")
+	}
+}
+
+// TestStaticNamespaceAvoidsScalarReportingCap checks the NRI/MPS response seam:
+// a 50% scheduler reservation must not hide a 72-SM static assignment.
+func TestStaticNamespaceAvoidsScalarReportingCap(t *testing.T) {
+	prov := &fakeProvisioner{pipeDirectory: testNamespacePipeDir, namespace: "kai_static", staticPartitions: true}
+	p := newProvisioningPlugin(t, prov, Config{SupportSMSharing: true})
+	pod := &api.PodSandbox{Name: "worker-random", Namespace: "models", Labels: map[string]string{"worker": "a"}, Annotations: map[string]string{
+		limitAnnotation: "19Gi", devicesAnnotation: "GPU-a,GPU-b", portionAnnotation: "0.5", modeAnnotation: "sm-sharing",
+	}}
+	adj, _, err := p.CreateContainer(context.Background(), pod, &api.Container{Id: "new-id", Name: "trainer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := valueOfAdd(adjustmentEnv(adj), injection.EnvMPSActiveThreadPercentage); got != "100" {
+		t.Fatal(got)
+	}
+	request := prov.provisionRequests()[0]
+	if request.ActiveThreadPercent != 50 || request.Container != "trainer" || request.PodLabels["worker"] != "a" {
+		t.Fatal(request)
+	}
+	if got := valueOfAdd(adjustmentEnv(adj), injection.EnvGPUMemoryLimit); got != "19456" {
+		t.Fatal("memory limit changed", got)
 	}
 }

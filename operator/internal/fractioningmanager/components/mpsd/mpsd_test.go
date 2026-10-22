@@ -627,3 +627,22 @@ func argValue(args []string, flag string) string {
 	}
 	return ""
 }
+
+func TestStaticPartitionPolicyConfigMapIsRequired(t *testing.T) {
+	ref := &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "sm-policy-v1"}, Key: "policy.json", Optional: ptr.To(true)}
+	d := NewMpsdDaemon(&v1alpha1.MpsDaemonSpec{SMPartitionPolicy: ref}, true, true)
+	ds := d.BuildDaemonSet(defaultOpts())
+	for _, e := range ds.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "MPS_SM_PARTITION_POLICY" {
+			got := e.ValueFrom.ConfigMapKeyRef
+			if got.Name != ref.Name || got.Key != ref.Key || got.Optional == nil || *got.Optional {
+				t.Fatal(got)
+			}
+			if !*ref.Optional {
+				t.Fatal("mutated caller's selector")
+			}
+			return
+		}
+	}
+	t.Fatal("missing required policy ConfigMap reference")
+}

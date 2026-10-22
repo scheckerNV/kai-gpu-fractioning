@@ -2415,6 +2415,33 @@ spec:
                         the daemon pod spec and never populates spec.resourceClaims,
                         so a claim entry could not resolve'
                       rule: '!has(self.claims) || size(self.claims) == 0'
+                  smPartitionPolicy:
+                    description: |-
+                      smPartitionPolicy supplies an administrator-owned JSON policy from a ConfigMap
+                      in the operator namespace. Optional; requires the r620 namespace defaults API.
+                      This binds static partitions and does not add asymmetric KAI scheduling.
+                      Changing ConfigMap data requires restarting mpsd with affected clients stopped.
+                    properties:
+                      key:
+                        description: The key to select.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the ConfigMap or its key must
+                          be defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
                   stableThreshold:
                     description: |-
                       stableThreshold is how long the MPS daemon must run to be considered stable.

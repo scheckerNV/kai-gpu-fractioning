@@ -213,6 +213,13 @@ type MetricNamesSpec struct {
 // mpsd supervises nvidia-cuda-mps-control, providing GPU multi-process
 // service to containers sharing a GPU.
 type MpsDaemonSpec struct {
+	// smPartitionPolicy supplies an administrator-owned JSON policy from a ConfigMap
+	// in the operator namespace. Optional; requires the r620 namespace defaults API.
+	// This binds static partitions and does not add asymmetric KAI scheduling.
+	// Changing ConfigMap data requires restarting mpsd with affected clients stopped.
+	// +optional
+	SMPartitionPolicy *corev1.ConfigMapKeySelector `json:"smPartitionPolicy,omitempty"`
+
 	// logLevel controls the logging verbosity of the MPS daemon supervisor.
 	// One of debug, info, warn, error. Default: info.
 	// +optional

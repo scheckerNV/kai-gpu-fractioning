@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/kai-scheduler/kai-gpu-fractioning/fractioning-manager/common/smpolicy"
 )
 
 const (
@@ -43,6 +45,8 @@ type Lease struct {
 	// otherwise; it is carried so a namespace in `namespace list` can be traced
 	// back to the GPUs its container was placed on.
 	GPUUUIDs []string `json:"gpuUuids,omitempty"`
+	// SMPartitions is the exact device map to restore after MPS restarts.
+	SMPartitions []smpolicy.Partition `json:"smPartitions,omitempty"`
 	// CreatedAt is when the lease was first taken. Reconciliation uses it to
 	// avoid pruning a namespace provisioned moments before mpsd restarted, for
 	// a container whose first process has not started yet.

@@ -15,6 +15,7 @@ import (
 )
 
 type cliFlags struct {
+	smPartitionPolicy string
 	// mpsBinary is the path to the nvidia-cuda-mps-control binary.
 	mpsBinary string
 	// controlPort is the -p value for nvidia-cuda-mps-control.
@@ -126,6 +127,7 @@ func parseFlags() cliFlags {
 	flag.DurationVar(&f.namespaceOrphanGrace, "namespace-orphan-grace",
 		env.Duration("MPS_NAMESPACE_ORPHAN_GRACE", mpsns.DefaultOrphanGrace),
 		"how long a freshly provisioned MPS namespace is protected from being reclaimed, covering the window between a container being created and starting its first process")
+	flag.StringVar(&f.smPartitionPolicy, "sm-partition-policy", env.String("MPS_SM_PARTITION_POLICY", ""), "administrator-owned JSON policy for per-device static namespace defaults (requires r620); empty keeps legacy scalar compute")
 	flag.Parse()
 	return f
 }

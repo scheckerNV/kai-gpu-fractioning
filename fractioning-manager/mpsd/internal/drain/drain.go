@@ -351,6 +351,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	lease, err := s.namespaces.Provision(r.Context(), mpsns.Request{
 		ContainerID:         req.ContainerID,
+		Container:           req.Container,
+		PodLabels:           req.PodLabels,
 		ActiveThreadPercent: req.ActiveThreadPercent,
 		GPUUUIDs:            req.GPUUUIDs,
 		Pod:                 req.Pod,
@@ -368,6 +370,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		Namespace:           lease.Namespace,
 		Server:              lease.Server,
 		ActiveThreadPercent: lease.ActiveThreadPercent,
+		StaticPartitions:    len(lease.SMPartitions) > 0,
 	})
 }
 

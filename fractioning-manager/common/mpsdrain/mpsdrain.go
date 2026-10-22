@@ -109,7 +109,9 @@ type ProvisionRequest struct {
 	// ContainerID is the runtime's container id. It is the whole identity of
 	// the namespace: mpsd derives the namespace name from it, and it is what
 	// ReleaseRequest gives back.
-	ContainerID string `json:"containerId"`
+	ContainerID string            `json:"containerId"`
+	Container   string            `json:"container,omitempty"`
+	PodLabels   map[string]string `json:"podLabels,omitempty"`
 	// ActiveThreadPercent is the ceiling to put on the namespace, 1..100.
 	//
 	// A whole percent rather than the scheduler's (0, 1] portion, because the
@@ -142,6 +144,8 @@ type ProvisionResponse struct {
 	Server    string `json:"server"`
 	// ActiveThreadPercent is the ceiling that was applied.
 	ActiveThreadPercent int `json:"activeThreadPercent"`
+	// StaticPartitions means namespace defaults, not a scalar ATP, define capacity.
+	StaticPartitions bool `json:"staticPartitions,omitempty"`
 }
 
 // ReleaseRequest gives a container's namespace back.

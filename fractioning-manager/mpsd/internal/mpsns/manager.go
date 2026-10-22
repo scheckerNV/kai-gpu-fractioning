@@ -47,10 +47,11 @@
 //     uncapped; mpsd additionally caps `default` itself, so that mistake costs
 //     a small share rather than the card.
 //
-// SM partitions are deliberately NOT used. They are exact and hardware-
-// enforced, but CUDA_MPS_SM_PARTITION is chosen by the client and is not
-// validated against the namespace: a container in a 40-SM namespace was
-// measured taking a 136-SM partition. They cannot be a security boundary.
+// Static partitions are opt-in through an administrator-owned policy. They
+// require the r620 namespace per-device default API; the daemon assignment
+// overrides tested client selectors. Older drivers reject this setup rather
+// than falling back to CUDA_MPS_SM_PARTITION in the client environment.
+// Scalar-only deployments retain the legacy namespace ATP path.
 //
 // # Known residual gap
 //
@@ -65,6 +66,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+
+	"github.com/kai-scheduler/kai-gpu-fractioning/fractioning-manager/common/smpolicy"
 	"slices"
 	"strings"
 	"sync"
@@ -136,7 +139,9 @@ type Request struct {
 	ActiveThreadPercent int
 	// GPUUUIDs are the devices the scheduler assigned (diagnostic; see
 	// Lease.GPUUUIDs).
-	GPUUUIDs []string
+	GPUUUIDs  []string
+	Container string
+	PodLabels map[string]string
 	// Pod and Namespace are carried for logging only.
 	Pod, Namespace string
 }
@@ -145,6 +150,8 @@ type Request struct {
 type Options struct {
 	// Control drives the control daemon. Required.
 	Control Control
+	// SMPartitionPolicy is optional and administrator-owned; it does not schedule GPUs.
+	SMPartitionPolicy *smpolicy.Policy
 	// Server is the MPS server namespaces are created on. Required.
 	Server string
 	// StatePath is the file the lease set is persisted to. Empty disables
@@ -177,6 +184,7 @@ type Options struct {
 // create failure that looks like a real one.
 type Manager struct {
 	control             Control
+	partitionPolicy     *smpolicy.Policy
 	server              string
 	store               store
 	defaultNamespaceATP int
@@ -199,6 +207,17 @@ func New(opts Options) (*Manager, error) {
 	if opts.Server == "" {
 		return nil, fmt.Errorf("MPS namespace manager needs a server name")
 	}
+	if err := opts.SMPartitionPolicy.Validate(); err != nil {
+		return nil, err
+	}
+	if opts.SMPartitionPolicy != nil {
+		if opts.StatePath == "" {
+			return nil, fmt.Errorf("static SM partition policy requires persistent namespace state")
+		}
+		if _, ok := opts.Control.(partitionControl); !ok {
+			return nil, fmt.Errorf("static SM partition policy requires per-device namespace control")
+		}
+	}
 	atp := opts.DefaultNamespaceATP
 	if atp == 0 {
 		atp = DefaultDefaultNamespaceATP
@@ -218,6 +237,7 @@ func New(opts Options) (*Manager, error) {
 
 	return &Manager{
 		control:             opts.Control,
+		partitionPolicy:     opts.SMPartitionPolicy,
 		server:              opts.Server,
 		store:               store{path: opts.StatePath},
 		defaultNamespaceATP: atp,
@@ -253,6 +273,13 @@ func (m *Manager) Provision(ctx context.Context, req Request) (Lease, error) {
 		return Lease{}, fmt.Errorf("provisioning an MPS namespace for container %q: active thread percentage %d is out of range, expected 1..100",
 			req.ContainerID, req.ActiveThreadPercent)
 	}
+	parts, err := m.partitionPolicy.Resolve(req.Namespace, req.Container, req.PodLabels, req.GPUUUIDs)
+	if err != nil {
+		return Lease{}, err
+	}
+	if len(parts) > 0 {
+		req.ActiveThreadPercent = 100
+	}
 	name, err := Name(req.ContainerID)
 	if err != nil {
 		return Lease{}, err
@@ -265,9 +292,23 @@ func (m *Manager) Provision(ctx context.Context, req Request) (Lease, error) {
 		// its cap: the daemon is the authority below, and reconciliation will
 		// sort the bookkeeping out.
 		m.log.Warn("could not load the MPS namespace state; continuing from an empty set", "error", err)
+		if len(parts) > 0 {
+			return Lease{}, fmt.Errorf("static partition ownership state is unavailable: %w", err)
+		}
 	}
 
 	existing, known := m.leases[req.ContainerID]
+	if known && !existing.released() && !slices.Equal(existing.SMPartitions, parts) {
+		return Lease{}, ErrCapChangeNeedsRestart
+	}
+	if err := m.checkPartitionClaims(req.ContainerID, parts); err != nil {
+		return Lease{}, err
+	}
+	if len(parts) > 0 {
+		if err := m.ensurePartitions(ctx, m.partitionPolicy.Definitions()); err != nil {
+			return Lease{}, err
+		}
+	}
 	if known && !existing.released() && existing.ActiveThreadPercent != req.ActiveThreadPercent {
 		return Lease{}, fmt.Errorf("container %q holds MPS namespace %q capped at %d%%, not %d%%: %w",
 			req.ContainerID, existing.Namespace, existing.ActiveThreadPercent, req.ActiveThreadPercent, ErrCapChangeNeedsRestart)
@@ -316,6 +357,15 @@ func (m *Manager) Provision(ctx context.Context, req Request) (Lease, error) {
 		}
 	}
 
+	if len(parts) > 0 {
+		if err := m.bindPartitions(ctx, name, parts, fresh || !known || existing.released()); err != nil {
+			if fresh {
+				m.deleteNamespace(ctx, name)
+			}
+			return Lease{}, err
+		}
+	}
+
 	lease := Lease{
 		ContainerID:         req.ContainerID,
 		Namespace:           name,
@@ -323,13 +373,16 @@ func (m *Manager) Provision(ctx context.Context, req Request) (Lease, error) {
 		PipeDirectory:       pipeDir,
 		ActiveThreadPercent: req.ActiveThreadPercent,
 		GPUUUIDs:            slices.Clone(req.GPUUUIDs),
+		SMPartitions:        slices.Clone(parts),
 		CreatedAt:           m.now(),
 	}
 	if known && !existing.released() {
 		lease.CreatedAt = existing.CreatedAt
 	}
 	m.leases[req.ContainerID] = lease
-	m.persist()
+	if err := m.persist(); err != nil && len(parts) > 0 {
+		return Lease{}, fmt.Errorf("persisting static partition lease before container startup: %w", err)
+	}
 
 	m.log.Info("provisioned MPS namespace",
 		"containerId", req.ContainerID,
@@ -424,6 +477,10 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 
 	m.pruneDeadLeases(ctx)
 
+	if err := m.ensurePartitions(ctx, m.partitionPolicy.Definitions()); err != nil {
+		problems = append(problems, err)
+	}
+
 	existing, err := m.control.NamespaceNames(ctx, m.server)
 	if err != nil {
 		problems = append(problems, fmt.Errorf("listing MPS namespaces: %w", err))
@@ -511,6 +568,8 @@ func (m *Manager) Leases() []Lease {
 	_ = m.ensureLoaded()
 	out := make([]Lease, 0, len(m.leases))
 	for _, lease := range m.leases {
+		lease.GPUUUIDs = slices.Clone(lease.GPUUUIDs)
+		lease.SMPartitions = slices.Clone(lease.SMPartitions)
 		out = append(out, lease)
 	}
 	slices.SortFunc(out, func(a, b Lease) int { return strings.Compare(a.ContainerID, b.ContainerID) })
@@ -576,7 +635,10 @@ func (m *Manager) restore(ctx context.Context, lease Lease) error {
 	if err := m.control.SetNamespaceActiveThreadPercentage(ctx, lease.Server, lease.Namespace, lease.ActiveThreadPercent); err != nil {
 		return fmt.Errorf("re-capping MPS namespace %q for container %q: %w", lease.Namespace, lease.ContainerID, err)
 	}
-	return nil
+	if err := m.ensurePartitions(ctx, lease.SMPartitions); err != nil {
+		return err
+	}
+	return m.bindPartitions(ctx, lease.Namespace, lease.SMPartitions, true)
 }
 
 // deleteNamespace drops a namespace created moments ago on a path that then
@@ -595,6 +657,7 @@ func (m *Manager) ensureLoaded() error {
 	m.loaded = true
 	leases, err := m.store.load()
 	if err != nil {
+		m.loaded = false // A retry must not forget an unresolved ownership-state error.
 		return err
 	}
 	for _, lease := range leases {
@@ -609,7 +672,7 @@ func (m *Manager) ensureLoaded() error {
 // correct on the daemon, and the only thing lost is the ability to reconcile
 // them after a restart. Failing a container's provisioning over it would turn a
 // bookkeeping problem into an outage.
-func (m *Manager) persist() {
+func (m *Manager) persist() error {
 	leases := make([]Lease, 0, len(m.leases))
 	for _, lease := range m.leases {
 		leases = append(leases, lease)
@@ -617,5 +680,7 @@ func (m *Manager) persist() {
 	if err := m.store.save(leases); err != nil {
 		m.log.Error("could not persist the MPS namespace state; namespaces will not be reconciled after an mpsd restart",
 			"path", m.store.path, "error", err)
+		return err
 	}
+	return nil
 }

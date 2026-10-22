@@ -113,6 +113,11 @@ func (d *daemon) BuildDaemonSet(opts daemonmgr.BuildOptions) *appsv1.DaemonSet {
 		corev1.EnvVar{Name: "MPS_MEMACCT_AUDIT_LOG", Value: strconv.FormatBool(d.auditLog)},
 		corev1.EnvVar{Name: "MPS_SUPPORT_SM_SHARING", Value: strconv.FormatBool(d.supportSMSharing)},
 	)
+	if d.spec != nil && d.spec.SMPartitionPolicy != nil {
+		ref := d.spec.SMPartitionPolicy.DeepCopy()
+		ref.Optional = ptr.To(false) // Missing policy must not fall back to scalar limits.
+		container.Env = append(container.Env, corev1.EnvVar{Name: "MPS_SM_PARTITION_POLICY", ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: ref}})
+	}
 	container.Env = append(container.Env, daemonmgr.FIPSOnlyEnv(opts.FIPSOnly)...)
 	result.Spec.Template.Spec.Containers = append(result.Spec.Template.Spec.Containers, container)
 	result.Spec.Template.Spec.Volumes = append(result.Spec.Template.Spec.Volumes, volumes...)

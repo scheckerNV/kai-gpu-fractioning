@@ -460,7 +460,7 @@ func (p *Plugin) buildAdjustment(ctx context.Context, pod *api.PodSandbox, ctr *
 	visibleDevices := annotations.ParseVisibleDevices(pod.Annotations, ctr.Name, p.AnnotationPrefix)
 	pinnedMemLimit := injection.PinnedDeviceMemLimit(gpuMemoryCfg.Limit, injection.DeviceCount(visibleDevices))
 
-	pipeSource, pipeDestination, mpsNamespace, err := p.mpsPipeMount(ctx, pod, ctr, computeMode, computePercent, hasComputeCap, visibleDevices)
+	pipeSource, pipeDestination, mpsNamespace, clientComputePercent, err := p.mpsPipeMount(ctx, pod, ctr, computeMode, computePercent, hasComputeCap, visibleDevices)
 	if err != nil {
 		return nil, err
 	}
@@ -484,8 +484,8 @@ func (p *Plugin) buildAdjustment(ctx context.Context, pod *api.PodSandbox, ctr *
 	if pinnedMemLimit != "" {
 		setEnforcedEnv(adj, ctr, injection.EnvMPSPinnedDeviceMemLimit, pinnedMemLimit)
 	}
-	if hasComputeCap {
-		setEnforcedEnv(adj, ctr, injection.EnvMPSActiveThreadPercentage, strconv.Itoa(computePercent))
+	if clientComputePercent > 0 {
+		setEnforcedEnv(adj, ctr, injection.EnvMPSActiveThreadPercentage, strconv.Itoa(clientComputePercent))
 	}
 	adj.AddEnv(injection.EnvMPSPipeDirectory, pipeDestination)
 
@@ -561,10 +561,13 @@ func (p *Plugin) mpsPipeMount(
 	computePercent int,
 	hasComputeCap bool,
 	visibleDevices string,
-) (source, destination, namespace string, err error) {
+) (source, destination, namespace string, clientComputePercent int, err error) {
+	if hasComputeCap {
+		clientComputePercent = computePercent
+	}
 	if computeMode != annotations.ComputeModeSMSharing || p.provisioner == nil {
 		source, destination = injection.MPSPipeMount(p.MPSPipeDirectory, computeMode)
-		return source, destination, "", nil
+		return source, destination, "", clientComputePercent, nil
 	}
 
 	// No annotated portion means no cap was asked for, which is 100% — not a
@@ -579,6 +582,8 @@ func (p *Plugin) mpsPipeMount(
 
 	resp, err := p.provisioner.Provision(callCtx, mpsdrain.ProvisionRequest{
 		ContainerID:         ctr.GetId(),
+		Container:           ctr.GetName(),
+		PodLabels:           pod.GetLabels(),
 		ActiveThreadPercent: percent,
 		GPUUUIDs:            splitDevices(visibleDevices),
 		Pod:                 pod.GetName(),
@@ -591,14 +596,20 @@ func (p *Plugin) mpsPipeMount(
 			"activeThreadPercent", percent,
 			"error", err,
 		)
-		return "", "", "", fmt.Errorf("container %q in pod %q: provisioning its MPS namespace: %w", ctr.Name, pod.Name, err)
+		return "", "", "", 0, fmt.Errorf("container %q in pod %q: provisioning its MPS namespace: %w", ctr.Name, pod.Name, err)
 	}
 	if resp.PipeDirectory == "" {
-		return "", "", "", fmt.Errorf("container %q in pod %q: mpsd returned no MPS namespace pipe directory", ctr.Name, pod.Name)
+		return "", "", "", 0, fmt.Errorf("container %q in pod %q: mpsd returned no MPS namespace pipe directory", ctr.Name, pod.Name)
 	}
 
+	if resp.StaticPartitions {
+		if resp.ActiveThreadPercent != 100 {
+			return "", "", "", 0, fmt.Errorf("static namespace response must use ATP100")
+		}
+		clientComputePercent = 100
+	}
 	source, destination = injection.MPSNamespaceMount(resp.PipeDirectory)
-	return source, destination, resp.Namespace, nil
+	return source, destination, resp.Namespace, clientComputePercent, nil
 }
 
 // splitDevices turns the scheduler's comma-separated device assignment into a

@@ -435,3 +435,8 @@ Third-party components statically linked into the shipped binaries are listed in
 
 Copyright Contributors to KAI Scheduler, established as KAI Scheduler a Series of LF Projects, LLC.
 For website terms of use, trademark policy and other project policies please see [lfprojects.org/policies](https://lfprojects.org/policies/).
+
+## Experimental per-device static defaults
+
+See [namespace-default integration](docs/sm-partitions/README.md) for the opt-in
+r620 policy, startup ordering, persistence, tests and scheduling limitations.
